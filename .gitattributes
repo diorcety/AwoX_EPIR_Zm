@@ -1,0 +1,4 @@
+# Ghidra project files and firmware images must be stored byte-for-byte
+ghidra/** -text
+*.bin -text
+*.gzf -text

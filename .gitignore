@@ -1,0 +1,9 @@
+# Ghidra runtime / per-session files
+*.lock
+*.lock~
+*.ps
+*~journal.dat
+*~journal.bak
+*~index.bak
+ghidra/EPIR_Zm.rep/projectState
+ghidra/EPIR_Zm.rep/user/00/
