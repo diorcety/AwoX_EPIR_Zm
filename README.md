@@ -43,6 +43,10 @@ Image header (Telink format):
 | 0x10   | IRQ vector (`b 0x1a0`)                                                       |
 | 0x18   | Image size 0x31864                                                           |
 
+The last 4 bytes (file offset 0x31860) hold the image CRC:
+`~crc32(file[0:0x31860])`, little-endian (`74 D9 73 6C` in this image). Any
+patch to the image must update it.
+
 ## 2. TC32 → Thumb translation
 
 TC32 is ARMv4T Thumb-1 with the top 5 bits of each 16-bit instruction
@@ -208,6 +212,41 @@ Saturation), with level and colour from stored settings; Off when occupancy
 times out. **No lux value is sent with a detection**: the illuminance
 attribute only changes when a `0x15` frame arrives and is only reported by
 the reporting engine.
+
+### 5.5 Occupancy clearing and the stuck-occupancy bug
+
+Occupancy is set by a PIR event (`app_handleSensorEvent`: occupied flag
+`g_occState` bit 0, start time `g_occStartTime`, attribute → 1) and cleared in
+a single place, `app_occupancyTimeoutCheck`. That check runs only while the
+occupied flag is set and the timeout `g_occTimeout` is non-zero; when the
+timeout expires it sets the attribute to 0 (reported) and switches bound
+lights off. Factory default (`app_settingsFactoryDefaults`): `g_occTimeout` = 2
+units of 290,000 slow-timer ticks ≈ **18 s** after the last motion. While the
+occupied flag is set, `app_enterSleep` also adds a timer wake source so the
+device can wake to clear occupancy.
+
+**Bug:** `app_sensorSendCmd` (0x71132–0x71144) also clears the occupied flag
+whenever it sends **command 1 (configuration)** to the sensor MCU, but does
+not reset the Occupancy attribute. Configuration is sent by
+`app_sensorSendConfig` at boot, after a settings change, and when a `0x16`
+frame from the sensor MCU reports a configuration that differs from the
+stored one. If this happens during an occupied period:
+
+1. the attribute stays at 1;
+2. `app_occupancyTimeoutCheck` no longer runs (flag cleared);
+3. the sleep code no longer arms the timer wake.
+
+Occupancy then stays *detected* until the next motion re-arms the flag (and
+the timeout clears it ~18 s later) or the device reboots. Whether it occurs
+depends on the timing of the configuration exchange relative to motion,
+which makes it look like a race condition.
+
+Patch (not applied to the files in this repository):
+
+| File offset | Original (TC32) | Patched | Effect |
+|---|---|---|---|
+| 0x7134 | `01 C0` (`beq 0x7113a`) | `FF C0` (branch to the next instruction) | Command 1 no longer clears the occupied flag; the timeout always clears occupancy |
+| 0x31860 | `74 D9 73 6C` | recomputed | Image CRC (see §1) |
 
 ## 6. Power management
 
@@ -389,6 +428,26 @@ class EpirIlluminance(CustomCluster, IlluminanceMeasurement):
 Max interval 5 makes the device send the lux value about once per wake-up
 (i.e. with each detection), at the cost of one extra frame.
 
+**Stuck occupancy (§5.5).** Without patching the firmware, a possible
+workaround is to apply the same reporting override to the Occupancy Sensing
+cluster (add a second class based on `OccupancySensing` and a second
+`.replaces(..., endpoint_id=4)`), so that the device re-reports occupancy on
+every wake-up during real presence, and to filter the entity in Home
+Assistant so that it turns off when no fresh report arrives (untested):
+
+```yaml
+template:
+  - binary_sensor:
+      - name: "EPIR occupancy (filtered)"
+        device_class: occupancy
+        state: >
+          {{ is_state('binary_sensor.awox_epir_zm_occupancy', 'on')
+             and (now() - states.binary_sensor.awox_epir_zm_occupancy.last_reported).total_seconds() < 60 }}
+```
+
+Bindings to lights made directly on the device are not covered by this
+workaround.
+
 ## 13. Using the Ghidra project
 
 * Open `ghidra/EPIR_Zm.gpr` with Ghidra 12.1.4 or later, or import
@@ -420,6 +479,10 @@ Max interval 5 makes the device send the lux value about once per wake-up
 | 0x71b34 | `app_sleepDecide`             | Sleep decision and entry        |
 | 0x70fd8 | `app_sensorLinkIrqHandler`    | Sensor MCU frames               |
 | 0x71654 | `app_handleSensorEvent`       | Occupancy / lux / config events |
+| 0x71734 | `app_occupancyTimeoutCheck`   | Only place that clears occupancy |
+| 0x710e0 | `app_sensorSendCmd`           | Command to sensor MCU (contains the occupancy bug) |
+| 0x70fa0 | `app_sensorSendConfig`        | Queues configuration command 1  |
+| 0x70de8 | `app_settingsFactoryDefaults` | Default settings (timeout ≈ 18 s) |
 | 0x6e884 | `app_luxLevelToMeasuredValue` | Level → ZCL lux                 |
 | 0x7154c | `app_actionSendTask`          | Light commands to bound devices |
 | 0x71bb4 | `app_batteryAdcSample`        | Battery measurement             |
@@ -448,10 +511,17 @@ Max interval 5 makes the device send the lux value about once per wake-up
 | 0x846a81          | `reportingTab`                              |
 | 0x844b04          | `g_awoxCfg` (persisted at flash 0xd0000)    |
 | 0x843a00          | `led_patternTable`                          |
+| 0x843ad4          | `g_settings` (0x42 bytes, flash 0xd1000)    |
+| 0x843ad7          | `g_occTimeout`                              |
+| 0x843ade / 0x843adf | `g_cfgFlags` / `g_occState`               |
+| 0x843ae0          | `g_occStartTime`                            |
 
 ## 14. Open questions
 
 * Meaning of sensor-MCU commands 2/3 and of the `0x16` configuration byte.
-* Content of the 0xd1000 settings record (timeouts, light level/colour).
+* Full layout of the `g_settings` record (light level/colour fields) and how
+  the AwoX app writes it.
+* How often the sensor MCU sends `0x16` configuration frames, i.e. how often
+  the stuck-occupancy bug (§5.5) can trigger.
 * Remaining BLE sub-commands and the OTA/FOTA protocol details.
 * Exact Touchlink role of the 2–5 s button press.
